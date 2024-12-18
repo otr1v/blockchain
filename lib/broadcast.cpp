@@ -60,7 +60,7 @@ int create_receiving_socket(uint16_t port) {
     return sock;
 }
 
-int create_broadcast_socket(uint16_t port) {
+int create_broadcast_socket() {
     int broadcast_permission = 1;
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -80,6 +80,17 @@ int create_broadcast_socket(uint16_t port) {
     return sock;
 }
 
+
+int create_peer2peer_socket() {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("Socket creation failed");
+
+        return -1;
+    }
+
+    return sock;
+}
 
 bool is_mine_address(const sockaddr_in& addr) {
     ifaddrs *ifaddr, *ifa;
@@ -109,10 +120,33 @@ bool is_mine_address(const sockaddr_in& addr) {
 } // end anonymous namespace
 
 
+std::string address::to_string() {
+    sockaddr_in current_sockaddr = {};
+    std::memcpy(&current_sockaddr, this, sizeof(sockaddr));
+
+    char sender_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &current_sockaddr.sin_addr, sender_ip, INET_ADDRSTRLEN);
+
+    return sender_ip;
+}
+
+
 network::network(uint16_t port):
     port_(port),
     receiving_sock_(create_receiving_socket(port)),
-    broadcast_sock_(create_broadcast_socket(port)) {
+    broadcast_sock_(create_broadcast_socket()),
+    peer2peer_sock_(create_peer2peer_socket()){
+}
+
+bool network::send(buffer message, address target_addr) {
+    ssize_t sent_length = sendto(peer2peer_sock_, message.data, message.size, 0,
+                                 (struct sockaddr *) &target_addr, sizeof(target_addr));
+    if (sent_length < 0) {
+        perror("Error sending message");
+        return false;
+    }
+
+    return true;
 }
 
 bool network::broadcast(buffer message) {
@@ -130,7 +164,7 @@ bool network::broadcast(buffer message) {
     return true;
 }
 
-bool network::receive(buffer out_message) {
+bool network::receive(buffer out_message, address *out_sender_addr) {
     std::memset(out_message.data, 0, out_message.size);
 
     sockaddr_in sender_address;
@@ -138,6 +172,7 @@ bool network::receive(buffer out_message) {
 
     int received_length = recvfrom(receiving_sock_, out_message.data, out_message.size, 0, (struct sockaddr *) &sender_address, &address_length);
     if (received_length < 0) {
+        // TODO: check if this error or async
         return false;
     }
 
@@ -145,10 +180,7 @@ bool network::receive(buffer out_message) {
         return false; // this is mine message
     }
 
-    char sender_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &sender_address.sin_addr, sender_ip, INET_ADDRSTRLEN);
-
-    LOG("Received message from {}:{}", sender_ip, sender_address.sin_port);
+    std::memcpy(out_sender_addr, &sender_address, sizeof(sockaddr));
 
     return true;
 }
@@ -156,4 +188,5 @@ bool network::receive(buffer out_message) {
 network::~network() {
     close(receiving_sock_);
     close(broadcast_sock_);
+    close(peer2peer_sock_);
 }

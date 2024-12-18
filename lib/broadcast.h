@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 
 struct buffer {
@@ -23,12 +24,20 @@ struct buffer {
     }
 };
 
+// Opaque storage for address of a node (ip + port)
+struct address {
+    char data[16];
+
+    std::string to_string();
+};
+
 class network {
 public:
     network(uint16_t port);
 
+    bool send(buffer message, address target);
     bool broadcast(buffer message);
-    bool receive(buffer out_message);
+    bool receive(buffer out_message, address *out_sender_addr);
 
     ~network();
 
@@ -37,4 +46,5 @@ private:
 
     int broadcast_sock_;
     int receiving_sock_;
+    int peer2peer_sock_;
 };

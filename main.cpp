@@ -20,8 +20,9 @@ int main() {
             auto now = std::chrono::high_resolution_clock::now();
             std::chrono::duration<double> elapsed = now - start;
 
+            address sender_address;
             char recv[256] = {};
-            net.receive(recv);
+            net.receive(recv, &sender_address);
 
             if (elapsed.count() >= WAIT_TIME)
                 break;
