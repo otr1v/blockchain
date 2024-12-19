@@ -90,7 +90,7 @@ int create_peer2peer_socket() {
     }
 
     return sock;
-}
+}    
 
 bool is_mine_address(const sockaddr_in& addr) {
     ifaddrs *ifaddr, *ifa;

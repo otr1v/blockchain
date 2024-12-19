@@ -20,7 +20,7 @@ struct buffer {
 
     template <typename type>
     buffer(type &element):
-        buffer(element, sizeof(type)) {
+        buffer(&element, sizeof(type)) {
     }
 };
 
@@ -38,6 +38,14 @@ public:
     bool send(buffer message, address target);
     bool broadcast(buffer message);
     bool receive(buffer out_message, address *out_sender_addr);
+
+    network(const network &other) = delete;
+    network(const network &&other):
+        port_(other.port_),
+        broadcast_sock_(other.broadcast_sock_),
+        receiving_sock_(other.receiving_sock_),
+        peer2peer_sock_(other.peer2peer_sock_) {
+    }
 
     ~network();
 
