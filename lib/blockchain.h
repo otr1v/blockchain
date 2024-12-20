@@ -25,16 +25,16 @@ struct action {
 };
 
 struct block_data {
-    char votes[10 - 8];
+    char votes[32 - 8];
     uint8_t count_votes;
 
     void act(action action) {
-        assert(is_full());
+        assert(!is_full());
         votes[count_votes ++] = action.vote;
     }
 
     bool is_full() {
-        return count_votes == (sizeof(votes) / sizeof(*votes) - 1);
+        return count_votes == 3;
     }
 };
 
@@ -96,6 +96,18 @@ enum class transaction_type: uint16_t {
     NOTIFY_SIGNED = 0b10,
     ACT           = 0b11
 };
+
+
+inline const char* get_transaction_name(transaction_type type) {
+    switch (type) {
+    case transaction_type::DISCOVER:      return "DISCOVER";
+    case transaction_type::SYNC:          return "SYNC";
+    case transaction_type::NOTIFY_SIGNED: return "NOTIFY_SIGNED";
+    case transaction_type::ACT:           return "ACT";
+    default: assert(false && "Unhandeled transaction type");
+    }
+}
+
 
 struct transaction {
     uint32_t magic = BLOCK_MAGIC;
@@ -217,10 +229,14 @@ public:
 
         LOG("INIT: signing initial block - done: {}", arranged_blocks_.back().hash());
 
-        transaction sync { .channel = channel, .type = transaction_type::DISCOVER };
+        transaction sync {
+            .channel = channel,
+            .type = transaction_type::DISCOVER,
+            .sequence_number = current_sequence_number_ ++,
+        };
         broadcast(sync);
 
-        LOG("INIT: broadcasting sync request");
+        LOG("INIT: broadcasting DISCOVER");
     }
 
 private:
@@ -255,7 +271,7 @@ private:
         auto start = std::chrono::high_resolution_clock::now();
         while (!try_signing_block(new_block)) {
             auto now = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double> elapsed = now - start;
+            std::chrono::duration<double> elapsed = start - now;
 
             if (elapsed >= timeout)
                 return false;
@@ -271,13 +287,20 @@ private:
         bool is_verified = new_block.verify();
 
         if (is_verified)
-            LOG("SIGNING: successfully signed: {}", pow_blocks_.front().the_block.calculate_hash());
+            LOG("SIGNING: successfully signed: {}", new_block.calculate_hash());
 
         return is_verified;
     } 
 
     bool is_block_duplicate(const block &block) {
-        return block_registry_.find(block.calculate_hash()) != block_registry_.end();
+        if (block_registry_.find(block.calculate_hash()) != block_registry_.end())
+            return true;
+
+        for (const auto &orphan: pending_blocks_)
+            if (orphan.calculate_hash() == block.calculate_hash())
+                return true;
+
+        return false;
     }
 
     bool add_block(const block &new_block) {
@@ -314,7 +337,7 @@ private:
 
     void receive_block(const block &new_block) {
         if (!new_block.verify()) {
-            LOG("RECEIVE: discarding (wrong PoW): ", new_block.calculate_hash());
+            LOG("RECEIVE: discarding (wrong PoW): {}", new_block.calculate_hash());
             return; // discard the block, it's not signed properly
         }
 
@@ -331,11 +354,15 @@ private:
             transaction sync {
                 .channel = channel_,
                 .type = transaction_type::SYNC,
+                .sequence_number = current_sequence_number_ ++,
                 .signed_block = block.data()
             };
 
-            net_.send(sync, requester_address);
-            LOG("DISCOVER: sending: {} <- {}", requester_address.to_string(), block.hash());
+            // TODO: Why it doesn't work??
+            // net_.send(sync, requester_address);
+
+            net_.broadcast(sync);
+            LOG("SYNC: sending: {} <- {}", requester_address.to_string(), block.hash());
         }
     }
 
@@ -372,6 +399,7 @@ private:
         transaction act_transaction {
             .channel = channel_,
             .type = transaction_type::ACT,
+            .sequence_number = current_sequence_number_ ++,
             .act = act
         };
         broadcast(act_transaction);
@@ -402,46 +430,52 @@ private:
             address sender_address;
             transaction incoming_transaction;
             if (!net_.receive(incoming_transaction, &sender_address)) 
-                break;
+                return;
 
-            LOG("LISTEN: received transaction (seqno: {}) from {}",
-                incoming_transaction.sequence_number,
-                sender_address.to_string());
+            if (incoming_transaction.sequence_number < sequence_numbers_[sender_address]) {
+                // TODO: Why it always doubles? WHYYYY??
+                // LOG("LISTEN: discarded transaction - wrong seqno: {}, expected {}",
+                //     incoming_transaction.sequence_number,
+                //     sequence_numbers_[sender_address] - 1
+                // );
+                continue;
+            }
+
 
             if (incoming_transaction.magic != BLOCK_MAGIC) {
                 LOG("LISTEN: discarded transaction - wrong magic: {}", sender_address.to_string());
                 continue;
             }
 
-            if (incoming_transaction.channel != channel_ && incoming_transaction.type == transaction_type::ACT) {
+            LOG("LISTEN: received transaction {} (with seqno: {}, was: {}, channel: {}) from {}",
+                get_transaction_name(incoming_transaction.type),
+                incoming_transaction.sequence_number,
+                sequence_numbers_[sender_address],
+                incoming_transaction.channel,
+                sender_address.to_string());
+
+            if (incoming_transaction.channel != channel_) {
                 LOG("LISTEN: discarded transaction - wrong channel {} instead of {}: {}",
                     incoming_transaction.channel, channel_, sender_address.to_string());
                 continue;
             }
 
-            if (incoming_transaction.sequence_number < sequence_numbers_[sender_address]) {
-                LOG("LISTEN: discarded transaction - wrong seqno: ", sender_address.to_string());
-                continue;
-            }
+            sequence_numbers_[sender_address] = incoming_transaction.sequence_number + 1;
 
             switch (incoming_transaction.type) {
             case transaction_type::ACT:
-                LOG("LISTEN: received transaction is ACT with '{}'", incoming_transaction.act.vote);
                 act(incoming_transaction.act);
                 break;
 
             case transaction_type::DISCOVER:
-                LOG("LISTEN: received transaction is DISCOVER");
                 send_sync(sender_address);
                 break;
 
             case transaction_type::NOTIFY_SIGNED:
-                LOG("LISTEN: received transaction is NOTIFY_SIGNED");
                 receive_block(incoming_transaction.signed_block);
                 break;
 
             case transaction_type::SYNC:
-                LOG("LISTEN: received transaction is SYNC");
                 receive_block(incoming_transaction.signed_block);
                 break;
             }
@@ -454,7 +488,8 @@ private:
         transaction signed_new {
             .channel = channel_,
             .type = transaction_type::NOTIFY_SIGNED,
-            .signed_block = new_block
+            .sequence_number = current_sequence_number_ ++,
+            .signed_block = new_block,
         };
 
         broadcast(signed_new);
@@ -486,9 +521,11 @@ private:
         if (pow_blocks_.empty())
             return;
 
+        // TODO: verify parent
+
         // Remove blocks that got replaced
         while (!pow_blocks_.empty() && pow_blocks_.front().is_replaced) {
-            LOG("SIGNING: removed staged for signing block as replaced, parent: {}", pow_blocks_.front().the_block.previous_hash);
+            LOG("DISCARDING: unsigned, parent: {}", pow_blocks_.front().the_block.previous_hash);
             pow_blocks_.pop_front();
         }
 
@@ -534,7 +571,7 @@ private:
 
 public:
     void run() {
-        constexpr std::chrono::milliseconds min_iteration_time{20};
+        constexpr std::chrono::milliseconds min_iteration_time{1000};
 
         while (true) {
             LOG("STATUS pow signing: {}, pending: {}, total: {}, current votes: {}",
