@@ -25,8 +25,8 @@ struct action {
 };
 
 struct block_data {
-    char votes[256 - 16];
-    uint16_t count_votes;
+    char votes[10 - 8];
+    uint8_t count_votes;
 
     void act(action action) {
         assert(is_full());
@@ -101,6 +101,7 @@ struct transaction {
     uint32_t magic = BLOCK_MAGIC;
     uint16_t channel;
     transaction_type type;
+    uint32_t sequence_number = 0;
 
     union {
         block signed_block;
@@ -205,16 +206,19 @@ public:
         channel_(channel),
         arranged_blocks_(),
         block_registry_(),
-        pending_blocks_() {
+        pending_blocks_(),
+        current_sequence_number_(0) {
 
         LOG("INIT: signing initial block - in progress");
+
         arranged_blocks_.push_back(block {});
         sign_block(arranged_blocks_.back().data());
+        block_registry_[arranged_blocks_.back().hash()] = arranged_blocks_.size() - 1;
 
         LOG("INIT: signing initial block - done: {}", arranged_blocks_.back().hash());
 
         transaction sync { .channel = channel, .type = transaction_type::DISCOVER };
-        net_.broadcast(sync);
+        broadcast(sync);
 
         LOG("INIT: broadcasting sync request");
     }
@@ -238,9 +242,9 @@ private:
 
     std::optional<block> current_block_;
 
-    arranged_block_iterable_proxy root() {
-        return {arranged_blocks_, initial_block_index};
-    }
+    uint32_t current_sequence_number_;
+    std::unordered_map<address, uint32_t> sequence_numbers_;
+
 
 
     uint32_t random_pow_signature() {
@@ -274,9 +278,6 @@ private:
 
     bool is_block_duplicate(const block &block) {
         return block_registry_.find(block.calculate_hash()) != block_registry_.end();
-    }
-
-    void check_orphaned_pending() {
     }
 
     bool add_block(const block &new_block) {
@@ -365,9 +366,7 @@ private:
         return {arranged_blocks_, find_longest(root()).leaf};
     }
 
-    void act(action act) {
-        assert(!current_block_ || current_block_->data.is_full());
-
+    void broadcast_act(action act) {
         LOG("ACT: broadcasting act event '{}'", act.vote);
 
         transaction act_transaction {
@@ -375,7 +374,11 @@ private:
             .type = transaction_type::ACT,
             .act = act
         };
-        net_.broadcast(act_transaction);
+        broadcast(act_transaction);
+    }
+
+    void act(action act) {
+        assert(!current_block_ || current_block_->data.is_full());
 
         if (!current_block_) {
             // blockchain considers longest chain to be the correct one
@@ -401,16 +404,23 @@ private:
             if (!net_.receive(incoming_transaction, &sender_address)) 
                 break;
 
-            LOG("LISTEN: received transaction from {}", sender_address.to_string());
+            LOG("LISTEN: received transaction (seqno: {}) from {}",
+                incoming_transaction.sequence_number,
+                sender_address.to_string());
 
             if (incoming_transaction.magic != BLOCK_MAGIC) {
-                LOG("LISTEN: discarded transaction - wrong magic", sender_address.to_string());
+                LOG("LISTEN: discarded transaction - wrong magic: {}", sender_address.to_string());
                 continue;
             }
 
-            if (incoming_transaction.channel != channel_) {
-                LOG("LISTEN: discarded transaction - wrong channel: {} instead of {}", sender_address.to_string(),
-                    incoming_transaction.channel, channel_);
+            if (incoming_transaction.channel != channel_ && incoming_transaction.type == transaction_type::ACT) {
+                LOG("LISTEN: discarded transaction - wrong channel {} instead of {}: {}",
+                    incoming_transaction.channel, channel_, sender_address.to_string());
+                continue;
+            }
+
+            if (incoming_transaction.sequence_number < sequence_numbers_[sender_address]) {
+                LOG("LISTEN: discarded transaction - wrong seqno: ", sender_address.to_string());
                 continue;
             }
 
@@ -421,12 +431,14 @@ private:
                 break;
 
             case transaction_type::DISCOVER:
-                LOG("LISTEN: received transaction is DISOVER");
+                LOG("LISTEN: received transaction is DISCOVER");
                 send_sync(sender_address);
                 break;
 
             case transaction_type::NOTIFY_SIGNED:
                 LOG("LISTEN: received transaction is NOTIFY_SIGNED");
+                receive_block(incoming_transaction.signed_block);
+                break;
 
             case transaction_type::SYNC:
                 LOG("LISTEN: received transaction is SYNC");
@@ -445,7 +457,7 @@ private:
             .signed_block = new_block
         };
 
-        net_.broadcast(signed_new);
+        broadcast(signed_new);
         LOG("NOTIFY: broadcasting newly signed {}", pow_blocks_.front().the_block.calculate_hash());
     }
 
@@ -475,13 +487,18 @@ private:
             return;
 
         // Remove blocks that got replaced
-        while (pow_blocks_.front().is_replaced) {
+        while (!pow_blocks_.empty() && pow_blocks_.front().is_replaced) {
             LOG("SIGNING: removed staged for signing block as replaced, parent: {}", pow_blocks_.front().the_block.previous_hash);
             pow_blocks_.pop_front();
         }
 
+        if (pow_blocks_.empty())
+            return;
+
         if (sign_block(pow_blocks_.front().the_block, timeout)) {
             notify_signed(pow_blocks_.front().the_block);
+            bool has_parent = add_block(pow_blocks_.front().the_block);
+            assert(has_parent);
 
             pow_blocks_.pop_front();
         }
@@ -502,13 +519,22 @@ private:
         char vote;
         if (check_need_to_act("act", vote)) {
             LOG("ACT: registered need to act with '{}'", vote);
-            act({ vote });
+
+            action action { vote };
+
+            act(action);
+            broadcast_act(action);
         }
+    }
+
+    void broadcast(transaction message) {
+        message.sequence_number = current_sequence_number_ ++;
+        net_.broadcast(message);
     }
 
 public:
     void run() {
-        constexpr std::chrono::milliseconds min_iteration_time{1000};
+        constexpr std::chrono::milliseconds min_iteration_time{20};
 
         while (true) {
             LOG("STATUS pow signing: {}, pending: {}, total: {}, current votes: {}",
@@ -530,5 +556,9 @@ public:
             if (elapsed < min_iteration_time)
                 std::this_thread::sleep_for(min_iteration_time - elapsed);
         }
+    }
+
+    arranged_block_iterable_proxy root() {
+        return {arranged_blocks_, initial_block_index};
     }
 };

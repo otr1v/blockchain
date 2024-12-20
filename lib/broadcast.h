@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 
@@ -29,7 +30,27 @@ struct address {
     char data[16];
 
     std::string to_string();
+
+    auto operator<=>(const address &other) const {
+        return std::memcmp(data, other.data, sizeof(address));
+    }
+
+    constexpr bool operator==(const address &other) const { return ((*this) <=> other) == 0; };
+    constexpr bool operator!=(const address &other) const { return ((*this) <=> other) != 0; };
+    constexpr bool operator< (const address &other) const { return ((*this) <=> other) <  0; };
+    constexpr bool operator> (const address &other) const { return ((*this) <=> other) >  0; };
+    constexpr bool operator>=(const address &other) const { return ((*this) <=> other) >= 0; };
+    constexpr bool operator<=(const address &other) const { return ((*this) <=> other) <= 0; };
 };
+
+namespace std {
+    template <>
+    struct hash<address> {
+        size_t operator()(const address& addr) const noexcept {
+            return std::hash<uint16_t>{}(*(uint16_t*) &addr);
+        }
+    };
+}
 
 class network {
 public:
